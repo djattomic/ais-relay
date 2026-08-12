@@ -46,7 +46,10 @@ function connect() {
 
   ws.on('open', () => {
     console.log('aisstream connected');
+    // their own example uses `Apikey`; docs elsewhere say `APIKey`. Send both —
+    // whichever the server reads, the other is ignored.
     const sub = {
+      Apikey: KEY,
       APIKey: KEY,
       BoundingBoxes: BOXES,
       FilterMessageTypes: ['PositionReport', 'ShipStaticData']
