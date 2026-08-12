@@ -15,8 +15,13 @@ const KEY = process.env.AIS_KEY;
 const PORT = process.env.PORT || 8080;
 if (!KEY) { console.error('Set AIS_KEY'); process.exit(1); }
 
-// The lanes the globe draws. Each box is [[lat,lon],[lat,lon]].
+// One box while we confirm the stream feeds at all — aisstream appears to accept
+// only a small number, and eight produced silence. Narrow once data flows.
 const BOXES = [
+  [[-90, -180], [90, 180]]
+];
+
+/* The lanes the globe draws, for when per-region boxes work again:
   [[10, 45], [32, 62]],     // Gulf, Hormuz, Gulf of Oman
   [[10, 32], [32, 44]],     // Red Sea, Suez, Bab el-Mandeb
   [[-8, 95], [10, 110]],    // Malacca, Singapore
@@ -25,7 +30,7 @@ const BOXES = [
   [[48, -12], [62, 30]],    // North Sea, Baltic
   [[18, -98], [32, -60]],   // US Gulf, Caribbean
   [[-40, 10], [10, 25]]     // West Africa, Cape route
-];
+*/
 
 const SHIP_TYPE_TANKER = t => t >= 80 && t <= 89;
 const STALE_MS = 40 * 60 * 1000;
@@ -34,6 +39,7 @@ const vessels = new Map();   // mmsi -> { lat, lon, cog, name, type, at }
 
 let backoff = 5000;                 // aisstream allows one socket per key; a tight
 let seenMsgs = 0;                   // retry loop earns a 429, so back off on failure
+let seenTotal = 0;
 
 function connect() {
   const ws = new WebSocket('wss://stream.aisstream.io/v0/stream');
@@ -53,6 +59,7 @@ function connect() {
     let m;
     try { m = JSON.parse(raw); } catch (e) { console.log('non-JSON:', String(raw).slice(0, 200)); return; }
     if (seenMsgs < 3) { console.log('msg', seenMsgs, JSON.stringify(m).slice(0, 300)); seenMsgs++; }
+    seenTotal++;
     if (m.error || m.Error) { console.log('aisstream error:', m.error || m.Error); return; }
     backoff = 5000;                 // a real message means the key is good
     const meta = m.MetaData || {};
@@ -95,6 +102,9 @@ setInterval(() => {
   const cut = Date.now() - STALE_MS;
   for (const [k, v] of vessels) if ((v.at || 0) < cut) vessels.delete(k);
 }, 60000);
+
+// heartbeat so silence is distinguishable from a stalled process
+setInterval(() => console.log('heartbeat · ' + seenTotal + ' msgs · ' + vessels.size + ' vessels'), 30000);
 
 http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
