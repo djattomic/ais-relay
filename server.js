@@ -32,21 +32,29 @@ const STALE_MS = 40 * 60 * 1000;
 
 const vessels = new Map();   // mmsi -> { lat, lon, cog, name, type, at }
 
+let backoff = 5000;                 // aisstream allows one socket per key; a tight
+let seenMsgs = 0;                   // retry loop earns a 429, so back off on failure
+
 function connect() {
   const ws = new WebSocket('wss://stream.aisstream.io/v0/stream');
 
   ws.on('open', () => {
     console.log('aisstream connected');
-    ws.send(JSON.stringify({
+    const sub = {
       APIKey: KEY,
       BoundingBoxes: BOXES,
       FilterMessageTypes: ['PositionReport', 'ShipStaticData']
-    }));
+    };
+    console.log('subscribing:', JSON.stringify(sub).replace(KEY, 'KEY'));
+    ws.send(JSON.stringify(sub));
   });
 
   ws.on('message', (raw) => {
     let m;
-    try { m = JSON.parse(raw); } catch (e) { return; }
+    try { m = JSON.parse(raw); } catch (e) { console.log('non-JSON:', String(raw).slice(0, 200)); return; }
+    if (seenMsgs < 3) { console.log('msg', seenMsgs, JSON.stringify(m).slice(0, 300)); seenMsgs++; }
+    if (m.error || m.Error) { console.log('aisstream error:', m.error || m.Error); return; }
+    backoff = 5000;                 // a real message means the key is good
     const meta = m.MetaData || {};
     const mmsi = meta.MMSI || meta.MMSI_String;
     if (!mmsi) return;
@@ -74,7 +82,11 @@ function connect() {
     }
   });
 
-  ws.on('close', () => { console.log('closed, retrying in 5s'); setTimeout(connect, 5000); });
+  ws.on('close', () => {
+    console.log('closed, retrying in ' + Math.round(backoff / 1000) + 's');
+    setTimeout(connect, backoff);
+    backoff = Math.min(backoff * 2, 120000);
+  });
   ws.on('error', (e) => { console.log('error', e.message); try { ws.close(); } catch (x) {} });
 }
 connect();
