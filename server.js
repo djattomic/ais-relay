@@ -1,124 +1,26 @@
-/* AIS relay — holds the aisstream key server-side and republishes tanker
-   positions as plain CORS-open JSON the dashboard can poll.
+/* Military air history service.
 
-   aisstream refuses browser origins, so the page cannot talk to it directly.
-   This process keeps one long-lived socket open, remembers the latest position
-   per vessel, and serves them at GET /tankers.
+   The dashboard used to record airborne counts in the browser, which meant it
+   only sampled while a tab was open — a day covered for three hours was plotted
+   beside a day covered for twelve. This process runs continuously, samples on a
+   fixed cadence from one source, and serves a history that is comparable across
+   days. Counts use the same airframe filter as the page.
 
-   Run:  AIS_KEY=your-key node server.js
+     GET /milhistory   per-UTC-day mean, peak, sample count, distinct airframes
+     GET /             one-line status
+
+   Run:  node server.js
+
+   The aisstream tanker socket that used to live here was removed: the service
+   accepted the subscription and then sent nothing for weeks, and latterly refused
+   the socket with 429s. Global AIS is on hold until they answer; the dashboard's
+   tankers come from Digitraffic directly. Previous version is in git history.
 */
 
 import http from 'http';
 import fs from 'fs';
-import WebSocket from 'ws';
 
-const KEY = process.env.AIS_KEY;
 const PORT = process.env.PORT || 8080;
-if (!KEY) { console.error('Set AIS_KEY'); process.exit(1); }
-
-// One box while we confirm the stream feeds at all — aisstream appears to accept
-// only a small number, and eight produced silence. Narrow once data flows.
-const BOXES = [
-  [[-90, -180], [90, 180]]
-];
-
-/* The lanes the globe draws, for when per-region boxes work again:
-  [[10, 45], [32, 62]],     // Gulf, Hormuz, Gulf of Oman
-  [[10, 32], [32, 44]],     // Red Sea, Suez, Bab el-Mandeb
-  [[-8, 95], [10, 110]],    // Malacca, Singapore
-  [[18, 105], [42, 132]],   // South China Sea to Japan
-  [[30, -10], [46, 37]],    // Mediterranean, Adriatic, Black Sea
-  [[48, -12], [62, 30]],    // North Sea, Baltic
-  [[18, -98], [32, -60]],   // US Gulf, Caribbean
-  [[-40, 10], [10, 25]]     // West Africa, Cape route
-*/
-
-const SHIP_TYPE_TANKER = t => t >= 80 && t <= 89;
-const STALE_MS = 40 * 60 * 1000;
-
-const vessels = new Map();   // mmsi -> { lat, lon, cog, name, type, at }
-
-let backoff = 5000;                 // aisstream allows one socket per key; a tight
-let seenMsgs = 0;                   // retry loop earns a 429, so back off on failure
-let seenTotal = 0;
-
-function connect() {
-  const ws = new WebSocket('wss://stream.aisstream.io/v0/stream');
-
-  ws.on('open', () => {
-    console.log('aisstream connected');
-    // their own example uses `Apikey`; docs elsewhere say `APIKey`. Send both —
-    // whichever the server reads, the other is ignored.
-    const sub = {
-      Apikey: KEY,
-      APIKey: KEY,
-      BoundingBoxes: BOXES,
-      FilterMessageTypes: ['PositionReport', 'ShipStaticData']
-    };
-    console.log('subscribing:', JSON.stringify(sub).replace(KEY, 'KEY'));
-    ws.send(JSON.stringify(sub));
-  });
-
-  ws.on('message', (raw) => {
-    let m;
-    try { m = JSON.parse(raw); } catch (e) { console.log('non-JSON:', String(raw).slice(0, 200)); return; }
-    if (seenMsgs < 3) { console.log('msg', seenMsgs, JSON.stringify(m).slice(0, 300)); seenMsgs++; }
-    seenTotal++;
-    if (m.error || m.Error) { console.log('aisstream error:', m.error || m.Error); return; }
-    backoff = 5000;                 // a real message means the key is good
-    const meta = m.MetaData || {};
-    const mmsi = meta.MMSI || meta.MMSI_String;
-    if (!mmsi) return;
-    const prev = vessels.get(mmsi) || {};
-
-    if (m.MessageType === 'PositionReport') {
-      const p = m.Message.PositionReport;
-      vessels.set(mmsi, {
-        ...prev,
-        lat: p.Latitude, lon: p.Longitude,
-        cog: p.TrueHeading < 360 ? p.TrueHeading : p.Cog,
-        sog: p.Sog,
-        name: (meta.ShipName || prev.name || '').trim(),
-        at: Date.now()
-      });
-    } else if (m.MessageType === 'ShipStaticData') {
-      const s = m.Message.ShipStaticData;
-      vessels.set(mmsi, {
-        ...prev,
-        type: s.Type,
-        dest: (s.Destination || '').trim(),
-        draught: s.MaximumStaticDraught,
-        name: (s.Name || prev.name || '').trim()
-      });
-    }
-  });
-
-  ws.on('close', () => {
-    console.log('closed, retrying in ' + Math.round(backoff / 1000) + 's');
-    setTimeout(connect, backoff);
-    backoff = Math.min(backoff * 2, 120000);
-  });
-  ws.on('error', (e) => { console.log('error', e.message); try { ws.close(); } catch (x) {} });
-}
-connect();
-
-setInterval(() => {
-  const cut = Date.now() - STALE_MS;
-  for (const [k, v] of vessels) if ((v.at || 0) < cut) vessels.delete(k);
-}, 60000);
-
-// heartbeat so silence is distinguishable from a stalled process
-setInterval(() => console.log('heartbeat · ' + seenTotal + ' msgs · ' + vessels.size + ' vessels'), 30000);
-
-/* ── Military air sampler ───────────────────────────────────────────────────
-   The dashboard used to record airborne counts itself, which meant it only
-   sampled while a browser tab was open — a day covered for three hours was
-   plotted beside a day covered for twelve. This process runs continuously, so
-   it samples on a fixed cadence from one source and the history is comparable
-   across days. Counts use the same airframe filter as the page.
-
-   GET /milhistory returns per-UTC-day figures plus the raw samples.
-*/
 const MIL_FILE = process.env.MIL_FILE || './mil-history.json';
 const MIL_EVERY = 5 * 60 * 1000;
 const MIL_KEEP = 21 * 24 * 3600 * 1000;
@@ -173,9 +75,9 @@ async function milSample() {
   for (const i of order) {
     try {
       const list = await milFetch(MIL_SOURCES[i]);
+      if (!list.length) throw new Error('empty');
       const air = list.filter(a =>
         typeof a.lat === 'number' && a.alt_baro !== 'ground' && BIG_TYPES.test(a.t || ''));
-      if (!list.length) throw new Error('empty');
       milSrc = i;
       const t = Date.now();
       milSamples.push({ t, n: air.length, src: MIL_SOURCES[i].name });
@@ -202,7 +104,7 @@ milSample();
 setInterval(milSample, MIL_EVERY);
 
 /** Per-day figures. `samples` is the day's coverage — a low count means a weak
-    estimate, and the page greys those days out rather than pretending. */
+    estimate, and the page draws those days faint rather than pretending. */
 function milDays() {
   const by = new Map();
   for (const p of milSamples) {
@@ -233,18 +135,7 @@ http.createServer((req, res) => {
     }));
     return;
   }
-  if (req.url.startsWith('/tankers')) {
-    const out = [];
-    for (const [mmsi, v] of vessels) {
-      if (v.lat == null) continue;
-      if (v.type != null && !SHIP_TYPE_TANKER(v.type)) continue;
-      out.push({ id: mmsi, lat: v.lat, lon: v.lon, cog: v.cog || 0, sog: v.sog || 0,
-                 name: v.name || '', dest: v.dest || '', at: v.at });
-    }
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify(out));
-    return;
-  }
-  res.end('relay up · ' + vessels.size + ' vessels held · '
-    + milSamples.length + ' air samples');
+  const last = milSamples[milSamples.length - 1];
+  res.end('air history up · ' + milSamples.length + ' samples'
+    + (last ? ' · last ' + last.n + ' airborne from ' + last.src : ''));
 }).listen(PORT, () => console.log('listening on ' + PORT));
