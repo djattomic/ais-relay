@@ -21,6 +21,8 @@
 
 import http from 'http';
 import fs from 'fs';
+import zlib from 'zlib';
+import crypto from 'crypto';
 
 const PORT = process.env.PORT || 8080;
 const MIL_FILE = process.env.MIL_FILE || './mil-history.json';
@@ -583,13 +585,17 @@ function hzLean(o, s) {
   return null;
 }
 
-async function hzPoll() {
+async function hzPoll(retry = 0) {
   let arts;
   try { arts = await hzFetch(); }
   catch (e) {
     // a failed poll is not a reading: leave the streak and the state untouched
     hz.error = e.message;
     hzSave();
+    /* GDELT answers the first request from a cold datacentre IP with a 429 often
+       enough that waiting out the full interval would leave the panel blank for
+       ten minutes after every deploy. Two short retries, then wait for the tick. */
+    if (retry < 2) setTimeout(() => hzPoll(retry + 1), 90000 * (retry + 1));
     return;
   }
   hz.error = null;
@@ -662,14 +668,72 @@ setInterval(hzPoll, HZ_EVERY);
    Restore is additive and idempotent: crossings are keyed hex|gate|t and mil
    samples t|src, so re-posting the same archive twice changes nothing. */
 const RESTORE_TOKEN = process.env.RESTORE_TOKEN || '';
+const EXPORT_MAX = Number(process.env.EXPORT_MAX) || 2000;
 
-function exportDoc() {
+/* Every endpoint answers the same body to every caller, so the work is done once and
+   handed to whatever cache sits in front. Each response carries an ETag (so a poller
+   gets 304 and no body), Cache-Control with s-maxage (so a CDN serves the crowd from
+   the edge and this box sees one request per TTL) and gzip. The gzipped body is kept
+   against its ETag, so a thousand identical requests compress once. */
+const gzCache = new Map();   // etag -> Buffer
+function send(req, res, body, ttl, { type = 'application/json' } = {}) {
+  const text = typeof body === 'string' ? body : JSON.stringify(body);
+  const etag = 'W/"' + crypto.createHash('sha1').update(text).digest('base64').slice(0, 22) + '"';
+  res.setHeader('Content-Type', type);
+  res.setHeader('ETag', etag);
+  res.setHeader('Vary', 'Accept-Encoding');
+  res.setHeader('Access-Control-Expose-Headers', 'ETag');
+  res.setHeader('Cache-Control', ttl > 0
+    ? 'public, max-age=' + Math.round(ttl / 2) + ', s-maxage=' + ttl
+      + ', stale-while-revalidate=' + ttl
+    : 'no-store');
+  if ((req.headers['if-none-match'] || '').split(/,\s*/).includes(etag)) {
+    res.statusCode = 304;
+    res.end();
+    return;
+  }
+  const wantsGzip = /\bgzip\b/.test(req.headers['accept-encoding'] || '');
+  if (wantsGzip && text.length > 1024) {
+    let buf = gzCache.get(etag);
+    if (!buf) {
+      buf = zlib.gzipSync(Buffer.from(text), { level: 6 });
+      if (gzCache.size > 64) gzCache.delete(gzCache.keys().next().value);
+      gzCache.set(etag, buf);
+    }
+    res.setHeader('Content-Encoding', 'gzip');
+    res.setHeader('Content-Length', buf.length);
+    res.end(buf);
+    return;
+  }
+  res.end(text);
+}
+
+function exportDoc(since = 0, limit = EXPORT_MAX) {
   const seen = {};
   for (const [d, s] of milSeen) seen[d] = [...s];
+  const cut = Number(since) || 0;
+  /* Bounded on purpose: a thousand tabs each asking for the whole tail every five
+     minutes is the one thing on this box that costs real bandwidth. Each response
+     carries at most `limit` of each stream, oldest first, with `more` and `nextSince`
+     so the client walks forward across several pulls. */
+  const allSamples = milSamples.filter(p => p.t > cut);
+  const allCross = flow.crossings.filter(c => c.t > cut);
+  const samples = allSamples.slice(0, limit);
+  const crossings = allCross.slice(0, limit);
+  const more = samples.length < allSamples.length || crossings.length < allCross.length;
+  /* The two streams advance separately, so the resume mark is the lower of the two
+     ends — the same rule the page uses when it asks. */
+  const ends = [];
+  if (samples.length) ends.push(samples[samples.length - 1].t);
+  if (crossings.length) ends.push(crossings[crossings.length - 1].t);
+  const nextSince = more && ends.length ? Math.min(...ends) - 1 : null;
   return {
-    v: 1, at: Date.now(),
-    mil: { samples: milSamples, seen },
-    flow: { epoch: flow.epoch, crossings: flow.crossings,
+    v: 1, at: Date.now(), since: cut, more, nextSince,
+    /* The client keeps the record; `since` lets it ask only for what it has not
+       merged yet, so the pull stays small enough to run every few minutes. */
+    mil: { samples, seen },
+    flow: { epoch: flow.epoch, crossings,
+            oldest: flow.crossings.length ? flow.crossings[0].t : null,
             tankerEast: flow.tankerEast, tankerWest: flow.tankerWest },
     hormuz: { state: hz.state, since: hz.since, prev: hz.prev, flips: hz.flips, polls: hz.polls }
   };
@@ -769,12 +833,18 @@ http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') { res.statusCode = 204; res.end(); return; }
 
   if (req.url.startsWith('/export')) {
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify(exportDoc()));
+    let since = 0, limit = EXPORT_MAX;
+    try {
+      const q = new URL(req.url, 'http://x').searchParams;
+      since = Number(q.get('since')) || 0;
+      limit = Math.max(100, Math.min(EXPORT_MAX, Number(q.get('limit')) || EXPORT_MAX));
+    } catch (e) { /* full dump */ }
+    send(req, res, exportDoc(since, limit), 60);
     return;
   }
   if (req.url.startsWith('/restore')) {
     res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Cache-Control', 'no-store');
     if (req.method !== 'POST') {
       res.statusCode = 405;
       res.end(JSON.stringify({ error: 'POST an archive' }));
@@ -801,49 +871,46 @@ http.createServer(async (req, res) => {
     return;
   }
   if (req.url.startsWith('/hormuz')) {
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify(hzSnapshot()));
+    send(req, res, hzSnapshot(), 120);      // the detector polls every 10 min
     return;
   }
   if (req.url.startsWith('/series')) {
-    res.setHeader('Content-Type', 'application/json');
     try {
       const u = new URL(req.url, 'http://x');
-      res.end(await series(u.searchParams.get('sym'),
-        u.searchParams.get('interval') || '1d', u.searchParams.get('range') || '1y'));
+      const interval = u.searchParams.get('interval') || '1d';
+      const body = await series(u.searchParams.get('sym'), interval, u.searchParams.get('range') || '1y');
+      const intraday = /m$/.test(interval) && interval !== '1mo' && interval !== '3mo';
+      send(req, res, body, intraday ? 60 : 600);
     } catch (e) {
       res.statusCode = 502;
-      res.end(JSON.stringify({ error: e.message }));
+      send(req, res, { error: e.message }, 0);
     }
     return;
   }
 
   if (req.url.startsWith('/quotes')) {
-    res.setHeader('Content-Type', 'application/json');
     try {
-      res.end(JSON.stringify({ at: qCache.at, quotes: await quotes() }));
+      send(req, res, { at: qCache.at, quotes: await quotes() }, 60);
     } catch (e) {
       res.statusCode = 502;
-      res.end(JSON.stringify({ error: e.message, quotes: {} }));
+      send(req, res, { error: e.message, quotes: {} }, 0);
     }
     return;
   }
   if (req.url.startsWith('/milhistory')) {
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({
+    send(req, res, {
       every: MIL_EVERY, now: Date.now(),
       days: milDays(), samples: milSamples
-    }));
+    }, 120);
     return;
   }
   if (req.url.startsWith('/flow')) {
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify(flowSnapshot()));
+    send(req, res, flowSnapshot(), 60);
     return;
   }
   const last = milSamples[milSamples.length - 1];
-  res.end('air history up · ' + milSamples.length + ' samples'
+  send(req, res, 'air history up · ' + milSamples.length + ' samples'
     + ' · ' + flow.crossings.length + ' gate crossings'
     + ' · hormuz ' + (HZ_PIN || hz.state)
-    + (last ? ' · last ' + last.n + ' airborne from ' + last.src : ''));
+    + (last ? ' · last ' + last.n + ' airborne from ' + last.src : ''), 30, { type: 'text/plain' });
 }).listen(PORT, () => console.log('listening on ' + PORT));
