@@ -829,7 +829,7 @@ function readBody(req, cap = 24 * 1024 * 1024) {
 
 http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'content-type, x-restore-token');
+  res.setHeader('Access-Control-Allow-Headers', 'content-type, if-none-match, x-restore-token');
   if (req.method === 'OPTIONS') { res.statusCode = 204; res.end(); return; }
 
   if (req.url.startsWith('/export')) {
