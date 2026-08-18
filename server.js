@@ -67,9 +67,9 @@ const BIG_TYPES = /^(C135|K35R|R135|KC30|A332|A333|A339|A310|B703|E3TF|E3CF|E3|E
    a 3-day rate against the 30-day baseline. Weights follow the same idea —
    a costly airframe is a stronger signal than a routine hauler. */
 const GATES = [
-  { id: 'central_europe', route: 'Northern route', leg: 'Central Europe',
+  { id: 'central_europe', route: 'Middle East Northern route', leg: 'Central Europe',
     via: 'Ramstein · Balkans · E Med', bbox: [45.5, 14.0, 50.5, 23.0] },
-  { id: 'mediterranean', route: 'Southern route', leg: 'Mediterranean',
+  { id: 'mediterranean', route: 'Middle East Southern route', leg: 'Mediterranean',
     via: 'Lajes · Morón · Sigonella · Souda', bbox: [34.0, 2.0, 42.0, 20.0] }
 ];
 
@@ -446,7 +446,11 @@ const SYMS = {
   'US 3M': '^IRX', 'US 2Y': '2YY=F', 'US 5Y': '^FVX',
   'US 10Y': '^TNX', 'US 30Y': '^TYX', 'VIX': '^VIX', 'Crude vol': '^OVX'
 };
-const Q_TTL = 60 * 1000;
+/* 15s: one Yahoo batch per 15s serves every reader, whatever the visitor count —
+   the cache and the CDN headers below collapse the crowd into that one request.
+   The futures in this batch are ~10min delayed at source; the indices are not, and
+   they are what a faster clock buys. */
+const Q_TTL = 15 * 1000;
 const UA = 'Mozilla/5.0 (compatible; atomic-news-relay/1.0)';
 let qCache = { at: 0, data: null }, qInflight = null;
 
@@ -890,7 +894,7 @@ http.createServer(async (req, res) => {
 
   if (req.url.startsWith('/quotes')) {
     try {
-      send(req, res, { at: qCache.at, quotes: await quotes() }, 60);
+      send(req, res, { at: qCache.at, quotes: await quotes() }, 15);
     } catch (e) {
       res.statusCode = 502;
       send(req, res, { error: e.message, quotes: {} }, 0);
